@@ -1,0 +1,6 @@
+{
+  "name": "Azuku",
+  "description": "Next-generation Android developer toolkit and high-privilege service manager with 3D glass UI, shell terminal, ADB builder, and package controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,161 @@
+name: Build & Compress Azuku APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Variant'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - debug
+          - release
+      create_release:
+        description: 'Publish GitHub Release with APKs?'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Compress APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Set up Gradle Build Environment
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant Execute Permission to gradlew
+        run: chmod +x gradlew
+
+      - name: Restore Debug Keystore
+        run: |
+          if [ -f "debug.keystore.base64" ]; then
+            echo "Restoring debug.keystore from debug.keystore.base64..."
+            base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f "debug.keystore" ]; then
+            echo "Generating new debug.keystore..."
+            keytool -genkey -v -keystore debug.keystore -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Setup Release Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PATH: ${{ secrets.KEYSTORE_PATH }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Restoring release keystore from KEYSTORE_BASE64 secret..."
+            echo "$KEYSTORE_BASE64" | base64 -d > my-upload-key.jks
+            echo "KEYSTORE_PATH=$GITHUB_WORKSPACE/my-upload-key.jks" >> $GITHUB_ENV
+          elif [ -z "$KEYSTORE_PATH" ] && [ ! -f "my-upload-key.jks" ]; then
+            echo "No custom release keystore secret configured. Creating self-signed upload key..."
+            keytool -genkey -v -keystore my-upload-key.jks -storepass android \
+              -alias upload -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Azuku,OU=Dev,O=Azuku,C=US"
+            echo "KEYSTORE_PATH=$GITHUB_WORKSPACE/my-upload-key.jks" >> $GITHUB_ENV
+            echo "STORE_PASSWORD=android" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=android" >> $GITHUB_ENV
+          fi
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Build Debug APK
+        if: ${{ github.event.inputs.build_type == 'both' || github.event.inputs.build_type == 'debug' || github.event_name != 'workflow_dispatch' }}
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Build Release APK
+        if: ${{ github.event.inputs.build_type == 'both' || github.event.inputs.build_type == 'release' || github.event_name != 'workflow_dispatch' }}
+        env:
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || env.STORE_PASSWORD || 'android' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || env.KEY_PASSWORD || 'android' }}
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Collect and Compress APKs
+        run: |
+          mkdir -p release-artifacts
+          
+          # Copy Debug APK if built
+          if [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+            cp app/build/outputs/apk/debug/app-debug.apk release-artifacts/Azuku-v1.0-debug.apk
+            echo "Collected Azuku-v1.0-debug.apk"
+          fi
+          
+          # Copy Release APK if built
+          if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            cp app/build/outputs/apk/release/app-release.apk release-artifacts/Azuku-v1.0-release.apk
+            echo "Collected Azuku-v1.0-release.apk"
+          elif [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+            cp app/build/outputs/apk/release/app-release-unsigned.apk release-artifacts/Azuku-v1.0-release-unsigned.apk
+            echo "Collected Azuku-v1.0-release-unsigned.apk"
+          fi
+          
+          # Compress all APKs into a single high-compression ZIP package
+          cd release-artifacts
+          zip -9 -r Azuku-v1.0-APKs.zip *.apk
+          echo "Compressed APKs archive contents:"
+          ls -lh
+
+      - name: Upload APKs to GitHub Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Azuku-APKs
+          path: |
+            release-artifacts/*.apk
+            release-artifacts/Azuku-v1.0-APKs.zip
+          retention-days: 30
+
+      - name: Publish to GitHub Releases (On Tag or Release Request)
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/Azuku-v1.0-debug.apk
+            release-artifacts/Azuku-v1.0-release.apk
+            release-artifacts/Azuku-v1.0-APKs.zip
+          name: "Azuku ${{ github.ref_name || 'v1.0' }}"
+          body: |
+            ## Azuku Android Toolkit Release 🚀
+            
+            ### Included Artifacts:
+            - **`Azuku-v1.0-APKs.zip`**: Compressed bundle containing all APK builds.
+            - **`Azuku-v1.0-release.apk`**: Optimized release APK.
+            - **`Azuku-v1.0-debug.apk`**: Developer debug APK.
+            
+            ### Key Features:
+            - 3D Glass Dashboard & Live Daemon Status
+            - Interactive Shell Terminal with SQLite History
+            - ADB Command Builder & Wireless ADB Pairing Guide
+            - Package Manager & App Freezer
+            - Android 11–16 Permission Center & Settings Editor
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
